@@ -1,11 +1,11 @@
 # Spring Boot Idempotency Demo
 
-Demostración real del impacto de la idempotencia en APIs de pagos.
-El mismo request procesado 5 veces — con y sin protección.
+Demostración real del impacto de la idempotencia y la diferencia entre
+HashMap y ConcurrentHashMap bajo carga concurrente real.
 
 ---
 
-## Resultados
+## Resultado 1 — Idempotencia básica
 
 | Escenario | Pagos procesados | Duplicados bloqueados |
 |---|---|---|
@@ -17,50 +17,77 @@ El mismo request procesado 5 veces — con y sin protección.
 
 ---
 
-## ¿Qué es idempotencia?
+## Resultado 2 — HashMap vs ConcurrentHashMap · 100 threads concurrentes
 
-Una operación es idempotente cuando ejecutarla múltiples veces produce
-el mismo resultado que ejecutarla una sola vez.
+| Escenario | Threads | Procesados | Bloqueados | Errores |
+|---|---|---|---|---|
+| HashMap (NO thread-safe) | 100 | **100** | 0 | 0 |
+| ConcurrentHashMap (thread-safe) | 100 | **1** | **99** | 0 |
 
-En APIs de pagos es crítico — los clientes reintentan requests ante
-timeouts, errores de red o fallos de conectividad. Sin idempotencia,
-cada reintento genera un cobro adicional.
+**HashMap procesó el mismo pago 100 veces = $10.000 cobrados.**
+**ConcurrentHashMap procesó exactamente 1 vez = $100 cobrados.**
+
+Resultado consistente en 3 corridas consecutivas — no es aleatoriedad,
+es comportamiento determinístico de estructuras thread-safe vs no thread-safe.
 
 ---
 
-## Cómo funciona
+## ¿Por qué HashMap falla bajo concurrencia?
 ```java
-// SIN idempotencia — procesa siempre
-public String processPaymentUnsafe(String orderId, double amount) {
-    simulatePaymentProcessing();
-    return "Pago procesado";
-}
-
-// CON idempotencia — procesa solo una vez por orderId
-public String processPaymentSafe(String orderId, double amount) {
-    // putIfAbsent es atómico — thread-safe
-    String existing = idempotencyStore.putIfAbsent(orderId, "PROCESSING");
-    
-    if (existing != null) {
-        return "DUPLICADO BLOQUEADO — ya procesado";
-    }
-    
-    simulatePaymentProcessing();
-    idempotencyStore.put(orderId, "COMPLETED");
-    return "Pago procesado";
+// HashMap — get + put NO es atómico — race condition garantizada
+String existing = unsafeMap.get(orderId);  // Thread A lee null
+Thread.sleep(1);                            // Thread B también lee null
+if (existing == null) {
+    unsafeMap.put(orderId, "PROCESSED");   // Ambos escriben — duplicado
+    processed.incrementAndGet();
 }
 ```
 
+Con 100 threads ejecutando simultáneamente, todos leen `null` antes de
+que cualquiera escriba — todos procesan el pago.
+
 ---
 
-## La clave — putIfAbsent
+## ¿Por qué ConcurrentHashMap funciona?
+```java
+// ConcurrentHashMap — putIfAbsent es ATÓMICO
+String existing = safeMap.putIfAbsent(orderId, "PROCESSED");
+if (existing == null) {
+    processed.incrementAndGet(); // Solo 1 thread llega aquí
+} else {
+    duplicates.incrementAndGet(); // Los 99 restantes son bloqueados
+}
+```
 
-`ConcurrentHashMap.putIfAbsent()` es atómico — garantiza que aunque
-lleguen 100 requests concurrentes con el mismo `orderId`, solo uno
-pasa. Los demás son bloqueados inmediatamente.
+`putIfAbsent` es una operación atómica — aunque lleguen 100 threads
+simultáneamente, solo uno gana. Los demás reciben el valor existente.
+
+---
+
+## Idempotencia completa con ConcurrentHashMap
+```java
+@Service
+public class PaymentService {
+
+    private final ConcurrentHashMap<String, String> idempotencyStore
+        = new ConcurrentHashMap<>();
+
+    public String processPaymentSafe(String orderId, double amount) {
+        String existing = idempotencyStore.putIfAbsent(orderId, "PROCESSING");
+
+        if (existing != null) {
+            return "DUPLICADO BLOQUEADO — ya procesado";
+        }
+
+        simulatePaymentProcessing();
+        idempotencyStore.put(orderId, "COMPLETED");
+        return "Pago procesado";
+    }
+}
+```
 
 En producción reemplazás el `ConcurrentHashMap` por **Redis** con TTL
-para que el store de idempotencia sea distribuido y no se llene de memoria.
+para que el store sea distribuido entre múltiples instancias.
 
 ---
 
@@ -83,7 +110,8 @@ para que el store de idempotencia sea distribuido y no se llene de memoria.
 | `/api/payments/unsafe` | POST | Sin idempotencia — procesa siempre |
 | `/api/payments/safe` | POST | Con idempotencia — procesa una vez por orderId |
 | `/api/payments/stats` | GET | Ver totales procesados y duplicados bloqueados |
-| `/api/payments/reset` | POST | Resetear contadores para nueva prueba |
+| `/api/payments/reset` | POST | Resetear contadores |
+| `/api/payments/concurrency-test?threads=100` | GET | HashMap vs ConcurrentHashMap bajo carga |
 
 ---
 
@@ -97,6 +125,9 @@ java -jar target/springboot-idempotency-demo-1.0-SNAPSHOT.jar --logging.level.ro
 
 En otra terminal:
 ```bash
+# Test de concurrencia — HashMap vs ConcurrentHashMap
+curl "http://localhost:8080/api/payments/concurrency-test?threads=100"
+
 # Sin idempotencia — 5 requests, 5 pagos procesados
 for i in {1..5}; do
   curl -X POST "http://localhost:8080/api/payments/unsafe?orderId=ORDER-001&amount=100"
